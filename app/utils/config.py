@@ -10,11 +10,6 @@ from pydantic import BaseSettings
 class Settings(BaseSettings):
     """Application settings"""
 
-    # AWS Configuration
-    aws_access_key_id: str = os.getenv("AWS_ACCESS_KEY_ID", "")
-    aws_secret_access_key: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-    aws_region: str = os.getenv("AWS_REGION", "us-east-1")
-
     # S3 Configuration
     s3_bucket_name: str = os.getenv("S3_BUCKET_NAME", "")
 
@@ -43,4 +38,3 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get application settings (cached)"""
     return Settings()
-

@@ -17,12 +17,7 @@ class S3Service:
 
     def __init__(self):
         self.settings = get_settings()
-        self.s3_client = boto3.client(
-            's3',
-            aws_access_key_id=self.settings.aws_access_key_id,
-            aws_secret_access_key=self.settings.aws_secret_access_key,
-            region_name=self.settings.aws_region
-        )
+        self.s3_client = boto3.client('s3')
         self.bucket_name = self.settings.s3_bucket_name
 
     async def upload_file(
@@ -204,4 +199,3 @@ class S3Service:
         except ClientError as e:
             logger.error(f"Error listing files: {str(e)}")
             raise Exception(f"Failed to list files: {str(e)}")
-

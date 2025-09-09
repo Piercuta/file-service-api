@@ -29,8 +29,6 @@ Copy `env.example` to `.env` and configure:
 
 ```bash
 # AWS Configuration
-AWS_ACCESS_KEY_ID=your_access_key_here
-AWS_SECRET_ACCESS_KEY=your_secret_key_here
 AWS_REGION=us-east-1
 
 # S3 Configuration
@@ -84,8 +82,6 @@ The service is designed to run on EKS. Create a Kubernetes deployment with:
 
 ### Environment Variables
 
-- `AWS_ACCESS_KEY_ID`: AWS access key
-- `AWS_SECRET_ACCESS_KEY`: AWS secret key
 - `AWS_REGION`: AWS region
 - `S3_BUCKET_NAME`: S3 bucket name
 - `CLOUDFRONT_DOMAIN`: CloudFront distribution domain
