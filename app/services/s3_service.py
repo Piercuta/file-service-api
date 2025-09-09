@@ -4,10 +4,11 @@ S3 service for file operations
 
 import boto3
 import logging
+from datetime import datetime
 from typing import Optional, Dict, Any
 from fastapi import UploadFile
 from botocore.exceptions import ClientError, NoCredentialsError
-from .config import get_settings
+from ..utils.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class S3Service:
 
             # Read file content
             file_content = await file.read()
-
+            uploaded_at = datetime.utcnow().isoformat()
             # Upload to S3
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
@@ -56,7 +57,7 @@ class S3Service:
                 Metadata={
                     'original_name': file.filename,
                     'file_id': file_id,
-                    'uploaded_at': str(file.uploaded_at) if hasattr(file, 'uploaded_at') else ''
+                    'uploaded_at': uploaded_at
                 }
             )
 
