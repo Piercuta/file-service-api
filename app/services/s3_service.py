@@ -7,7 +7,7 @@ import logging
 from typing import Optional, Dict, Any
 from fastapi import UploadFile
 from botocore.exceptions import ClientError, NoCredentialsError
-from .config import get_settings
+from ..utils.config import get_settings
 
 logger = logging.getLogger(__name__)
 

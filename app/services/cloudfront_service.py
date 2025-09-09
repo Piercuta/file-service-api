@@ -4,7 +4,7 @@ CloudFront service for file URL generation
 
 import logging
 from typing import Optional
-from .config import get_settings
+from ..utils.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -58,4 +58,3 @@ class CloudFrontService:
         # For now, return regular CloudFront URL
         logger.warning("Signed URLs not implemented, returning regular URL")
         return self.get_file_url(s3_key)
-
