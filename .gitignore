@@ -248,6 +248,6 @@ temp/
 cdk.out/
 cdk.context.json
 
-# Local development
+# Local development (root-only — do not ignore k8s/overlays/dev)
 local/
-dev/
+/dev/
