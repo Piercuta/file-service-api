@@ -1,0 +1,191 @@
+# Build the file-service image, push it to ECR, then apply the matching
+# Kustomize overlay on EKS.
+#
+#   push `dev`              → build + deploy automatically (environment `dev`)
+#   push `master` / `main`  → build + deploy (manual play button, environment `prod`)
+#   git tag                 → build + deploy (manual play button, environment `prod`)
+#
+# GitLab CI/CD variables:
+#   AWS_ACCESS_KEY_ID      (masked)
+#   AWS_SECRET_ACCESS_KEY  (masked)
+#   AWS_REGION             optional, defaults to eu-west-1
+#
+# Terraform outputs used at deploy time:
+#   files_bucket_name, media_base_url, file_service_irsa_role_arn,
+#   eks_cluster_name, ecr_repository_urls["services/eks/file-service"]
+#
+# The IAM principal must be able to: read Terraform state, push to ECR, and
+# call the EKS API (EKS access entry on the cluster).
+# The GitLab runner must allow Docker-in-Docker (privileged / docker:dind).
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - build
+  - deploy
+
+variables:
+  TF_STATE_BUCKET: piercuta-terraform-state
+  TF_STATE_REGION: eu-west-1
+  AWS_DEFAULT_REGION: $AWS_REGION
+  AWS_REGION: eu-west-1
+  K8S_NAMESPACE: test-k8s
+  ECR_REPOSITORY: services/eks/file-service
+  DOCKER_TLS_CERTDIR: "/certs"
+
+.dev_vars: &dev_vars
+  TF_STATE_KEY: "test-k8s/dev/terraform.tfstate"
+  DEPLOY_ENV: dev
+  OVERLAY: dev
+  FLOATING_TAG: dev
+
+.prod_vars: &prod_vars
+  TF_STATE_KEY: "test-k8s/prod/terraform.tfstate"
+  DEPLOY_ENV: prod
+  OVERLAY: prod
+  FLOATING_TAG: latest
+
+build:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  environment:
+    name: $DEPLOY_ENV
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      variables:
+        <<: *dev_vars
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      variables:
+        <<: *prod_vars
+    - if: $CI_COMMIT_TAG
+      variables:
+        <<: *prod_vars
+  before_script:
+    - apk add --no-cache aws-cli jq
+  script:
+    - |
+      STATE_JSON=$(aws s3 cp \
+        "s3://${TF_STATE_BUCKET}/${TF_STATE_KEY}" \
+        - \
+        --region "${TF_STATE_REGION}")
+
+      CLUSTER=$(echo "$STATE_JSON" | jq -r '.outputs.eks_cluster_name.value')
+      ECR_URI=$(echo "$STATE_JSON" | jq -r --arg repo "$ECR_REPOSITORY" '.outputs.ecr_repository_urls.value[$repo]')
+      S3_BUCKET_NAME=$(echo "$STATE_JSON" | jq -r '.outputs.files_bucket_name.value')
+      MEDIA_BASE_URL=$(echo "$STATE_JSON" | jq -r '.outputs.media_base_url.value')
+      IRSA_ROLE_ARN=$(echo "$STATE_JSON" | jq -r '.outputs.file_service_irsa_role_arn.value')
+
+      CLOUDFRONT_DOMAIN="${MEDIA_BASE_URL#https://}"
+      CLOUDFRONT_DOMAIN="${CLOUDFRONT_DOMAIN#http://}"
+      CLOUDFRONT_DOMAIN="${CLOUDFRONT_DOMAIN%/}"
+
+      if [ -z "$CLUSTER" ] || [ "$CLUSTER" = "null" ]; then
+        echo "Missing Terraform output: eks_cluster_name" >&2
+        exit 1
+      fi
+      if [ -z "$ECR_URI" ] || [ "$ECR_URI" = "null" ]; then
+        echo "Missing Terraform output: ecr_repository_urls[${ECR_REPOSITORY}]" >&2
+        exit 1
+      fi
+      if [ -z "$S3_BUCKET_NAME" ] || [ "$S3_BUCKET_NAME" = "null" ]; then
+        echo "Missing Terraform output: files_bucket_name" >&2
+        exit 1
+      fi
+      if [ -z "$CLOUDFRONT_DOMAIN" ] || [ "$MEDIA_BASE_URL" = "null" ]; then
+        echo "Missing Terraform output: media_base_url" >&2
+        exit 1
+      fi
+      if [ -z "$IRSA_ROLE_ARN" ] || [ "$IRSA_ROLE_ARN" = "null" ]; then
+        echo "Missing Terraform output: file_service_irsa_role_arn" >&2
+        exit 1
+      fi
+
+      ECR_REGISTRY=$(echo "$ECR_URI" | cut -d/ -f1)
+      aws ecr get-login-password --region "${AWS_REGION}" \
+        | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      docker build \
+        -t "${ECR_URI}:${CI_COMMIT_SHA}" \
+        -t "${ECR_URI}:${FLOATING_TAG}" \
+        .
+      docker push "${ECR_URI}:${CI_COMMIT_SHA}"
+      docker push "${ECR_URI}:${FLOATING_TAG}"
+
+      {
+        echo "CLUSTER=${CLUSTER}"
+        echo "ECR_URI=${ECR_URI}"
+        echo "S3_BUCKET_NAME=${S3_BUCKET_NAME}"
+        echo "CLOUDFRONT_DOMAIN=${CLOUDFRONT_DOMAIN}"
+        echo "IRSA_ROLE_ARN=${IRSA_ROLE_ARN}"
+        echo "IMAGE_TAG=${CI_COMMIT_SHA}"
+      } > build.env
+
+      echo "Cluster=${CLUSTER} ECR=${ECR_URI} bucket=${S3_BUCKET_NAME} cf=${CLOUDFRONT_DOMAIN}"
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 day
+
+deploy:
+  stage: deploy
+  image: alpine:3.21
+  needs:
+    - job: build
+      artifacts: true
+  environment:
+    name: $DEPLOY_ENV
+  resource_group: deploy-eks-file-service-$DEPLOY_ENV
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      variables:
+        <<: *dev_vars
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: manual
+      variables:
+        <<: *prod_vars
+    - if: $CI_COMMIT_TAG
+      when: manual
+      variables:
+        <<: *prod_vars
+  before_script:
+    - apk add --no-cache aws-cli jq curl
+    - curl -sLO "https://dl.k8s.io/release/v1.32.3/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/kubectl
+    - curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.6.0/kustomize_v5.6.0_linux_amd64.tar.gz" | tar xz
+    - mv kustomize /usr/local/bin/kustomize
+    - kubectl version --client
+    - kustomize version
+  script:
+    - |
+      # Subshell so `cd` does not persist for later kubectl apply (GitLab concatenates script steps).
+      (
+        cd "k8s/overlays/${OVERLAY}"
+        printf 'S3_BUCKET_NAME=%s\nCLOUDFRONT_DOMAIN=%s\n' \
+          "$S3_BUCKET_NAME" "$CLOUDFRONT_DOMAIN" > generated-file-service.env
+        printf '%s\n' \
+          'apiVersion: v1' \
+          'kind: ServiceAccount' \
+          'metadata:' \
+          '  name: file-service' \
+          '  annotations:' \
+          "    eks.amazonaws.com/role-arn: ${IRSA_ROLE_ARN}" \
+          > irsa-patch.yaml
+        kustomize edit set image "file-service=${ECR_URI}:${IMAGE_TAG}"
+      )
+    - aws eks update-kubeconfig --name "${CLUSTER}" --region "${AWS_REGION}"
+    - |
+      echo "GitLab CI IAM identity (this ARN needs an EKS access entry):"
+      aws sts get-caller-identity
+      if ! kubectl get namespace "${K8S_NAMESPACE}"; then
+        echo "EKS rejected these credentials. Add this IAM principal as an access entry on ${CLUSTER} with AmazonEKSClusterAdminPolicy (terraform cluster_admin_principal_arns)." >&2
+        exit 1
+      fi
+    - kubectl apply -k "k8s/overlays/${OVERLAY}"
+    - kubectl rollout status "deployment/file-service" -n "${K8S_NAMESPACE}" --timeout=180s
