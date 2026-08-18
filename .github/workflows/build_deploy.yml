@@ -1,11 +1,10 @@
-# Build the file-service image, push it to ECR, then apply the matching Kustomize overlay on EKS.
+# Build the file-service image, push it to ECR, then apply the matching
+# Kustomize overlay on EKS. Infra values come from SSM Parameter Store:
+#   /<project>/<env>/<key>  e.g. /test-k8s/dev/eks_cluster_name
 #
-#   push `dev`             → build + deploy automatically
-#   push `master`            → build only
-#   Run workflow on `master` → build + deploy (manual prod release)
-#   Run workflow on `dev`  → build + deploy
-#
-# Required GitHub Environments: `dev` (branch `dev`) and `prod` (branch `master`).
+#   push `dev`              → build + deploy automatically (environment `dev`)
+#   push `master` / `main`  → build only
+#   Run workflow on `master` / `main` / tag → build + deploy (manual prod release)
 #
 # Secrets:
 #   AWS_ACCESS_KEY_ID
@@ -14,8 +13,7 @@
 # Vars (optional):
 #   AWS_REGION               defaults to eu-west-1
 #
-# The IAM principal must be able to: read Terraform state, push to ECR, and
-# call the EKS API (EKS access entry on the cluster).
+# IAM: ssm:GetParameter on /test-k8s/* , ECR push, EKS API access.
 
 name: Build and deploy to EKS
 
@@ -23,7 +21,10 @@ on:
   push:
     branches:
       - master
+      - main
       - dev
+    tags:
+      - "*"
   workflow_dispatch:
 
 permissions:
@@ -31,26 +32,24 @@ permissions:
   actions: write
 
 env:
-  TF_STATE_BUCKET: piercuta-terraform-state
-  TF_STATE_REGION: eu-west-1
+  PROJECT_NAME: test-k8s
   K8S_NAMESPACE: test-k8s
-  ECR_REPOSITORY: services/eks/file-service
-  OVERLAY: ${{ fromJSON('{"master":"prod","dev":"dev"}')[github.ref_name] }}
-  FLOATING_TAG: ${{ fromJSON('{"master":"latest","dev":"dev"}')[github.ref_name] }}
-  TF_STATE_KEY: ${{ fromJSON('{"master":"test-k8s/prod/terraform.tfstate","dev":"test-k8s/dev/terraform.tfstate"}')[github.ref_name] }}
+  DEPLOY_ENV: ${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
+  SSM_PREFIX: ${{ github.ref_name == 'dev' && '/test-k8s/dev' || '/test-k8s/prod' }}
+  OVERLAY: ${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
+  FLOATING_TAG: ${{ github.ref_name == 'dev' && 'dev' || 'latest' }}
 
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    if: github.ref_name == 'dev' || github.ref_name == 'master'
-    environment: ${{ fromJSON('{"master":"prod","dev":"dev"}')[github.ref_name] }}
+    environment: ${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
     outputs:
-      cluster: ${{ steps.tf.outputs.cluster }}
-      ecr_uri: ${{ steps.tf.outputs.ecr_uri }}
-      s3_bucket_name: ${{ steps.tf.outputs.s3_bucket_name }}
-      cloudfront_domain: ${{ steps.tf.outputs.cloudfront_domain }}
-      irsa_role_arn: ${{ steps.tf.outputs.irsa_role_arn }}
+      cluster: ${{ steps.ssm.outputs.cluster }}
+      ecr_uri: ${{ steps.ssm.outputs.ecr_uri }}
+      s3_bucket_name: ${{ steps.ssm.outputs.s3_bucket_name }}
+      cloudfront_domain: ${{ steps.ssm.outputs.cloudfront_domain }}
+      irsa_role_arn: ${{ steps.ssm.outputs.irsa_role_arn }}
       image_tag: ${{ github.sha }}
     steps:
       - name: Checkout
@@ -63,45 +62,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
 
-      - name: Read Terraform outputs
-        id: tf
+      - name: Read SSM parameters
+        id: ssm
         run: |
-          STATE_JSON=$(aws s3 cp \
-            "s3://${TF_STATE_BUCKET}/${TF_STATE_KEY}" \
-            - \
-            --region "${TF_STATE_REGION}")
+          ssm_get() {
+            val=$(aws ssm get-parameter --name "${SSM_PREFIX}/$1" --query Parameter.Value --output text)
+            if [ -z "$val" ] || [ "$val" = "None" ]; then
+              echo "Missing SSM parameter: ${SSM_PREFIX}/$1" >&2
+              exit 1
+            fi
+            printf '%s' "$val"
+          }
 
-          CLUSTER=$(echo "$STATE_JSON" | jq -r '.outputs.eks_cluster_name.value')
-          ECR_URI=$(echo "$STATE_JSON" | jq -r --arg repo "$ECR_REPOSITORY" '.outputs.ecr_repository_urls.value[$repo]')
-          S3_BUCKET_NAME=$(echo "$STATE_JSON" | jq -r '.outputs.files_bucket_name.value')
-          MEDIA_BASE_URL=$(echo "$STATE_JSON" | jq -r '.outputs.media_base_url.value')
-          IRSA_ROLE_ARN=$(echo "$STATE_JSON" | jq -r '.outputs.file_service_irsa_role_arn.value')
+          CLUSTER=$(ssm_get eks_cluster_name)
+          ECR_URI=$(ssm_get ecr_file_service)
+          S3_BUCKET_NAME=$(ssm_get files_bucket_name)
+          MEDIA_BASE_URL=$(ssm_get media_base_url)
+          IRSA_ROLE_ARN=$(ssm_get file_service_irsa_role_arn)
 
-          # App expects host[/path] without scheme (see CloudFrontService.get_file_url).
           CLOUDFRONT_DOMAIN="${MEDIA_BASE_URL#https://}"
           CLOUDFRONT_DOMAIN="${CLOUDFRONT_DOMAIN#http://}"
           CLOUDFRONT_DOMAIN="${CLOUDFRONT_DOMAIN%/}"
-
-          if [ -z "$CLUSTER" ] || [ "$CLUSTER" = "null" ]; then
-            echo "Missing Terraform output: eks_cluster_name" >&2
-            exit 1
-          fi
-          if [ -z "$ECR_URI" ] || [ "$ECR_URI" = "null" ]; then
-            echo "Missing Terraform output: ecr_repository_urls[${ECR_REPOSITORY}]" >&2
-            exit 1
-          fi
-          if [ -z "$S3_BUCKET_NAME" ] || [ "$S3_BUCKET_NAME" = "null" ]; then
-            echo "Missing Terraform output: files_bucket_name" >&2
-            exit 1
-          fi
-          if [ -z "$CLOUDFRONT_DOMAIN" ] || [ "$MEDIA_BASE_URL" = "null" ]; then
-            echo "Missing Terraform output: media_base_url" >&2
-            exit 1
-          fi
-          if [ -z "$IRSA_ROLE_ARN" ] || [ "$IRSA_ROLE_ARN" = "null" ]; then
-            echo "Missing Terraform output: file_service_irsa_role_arn" >&2
-            exit 1
-          fi
 
           echo "cluster=${CLUSTER}" >> "$GITHUB_OUTPUT"
           echo "ecr_uri=${ECR_URI}" >> "$GITHUB_OUTPUT"
@@ -122,8 +103,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ steps.tf.outputs.ecr_uri }}:${{ github.sha }}
-            ${{ steps.tf.outputs.ecr_uri }}:${{ env.FLOATING_TAG }}
+            ${{ steps.ssm.outputs.ecr_uri }}:${{ github.sha }}
+            ${{ steps.ssm.outputs.ecr_uri }}:${{ env.FLOATING_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -131,11 +112,10 @@ jobs:
     name: Deploy
     needs: build
     runs-on: ubuntu-latest
-    # Auto on dev. On master, only when the workflow is started manually.
     if: github.ref_name == 'dev' || github.event_name == 'workflow_dispatch'
-    environment: ${{ fromJSON('{"master":"prod","dev":"dev"}')[github.ref_name] }}
+    environment: ${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
     concurrency:
-      group: deploy-eks-file-service-${{ github.ref_name }}
+      group: deploy-eks-file-service-${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
       cancel-in-progress: false
     steps:
       - name: Checkout
@@ -168,15 +148,14 @@ jobs:
         run: |
           printf 'S3_BUCKET_NAME=%s\nCLOUDFRONT_DOMAIN=%s\n' \
             "$S3_BUCKET_NAME" "$CLOUDFRONT_DOMAIN" > generated-file-service.env
-
-          cat > irsa-patch.yaml <<EOF
-          apiVersion: v1
-          kind: ServiceAccount
-          metadata:
-            name: file-service
-            annotations:
-              eks.amazonaws.com/role-arn: ${IRSA_ROLE_ARN}
-          EOF
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: ServiceAccount' \
+            'metadata:' \
+            '  name: file-service' \
+            '  annotations:' \
+            "    eks.amazonaws.com/role-arn: ${IRSA_ROLE_ARN}" \
+            > irsa-patch.yaml
 
       - name: Set image tag
         working-directory: k8s/overlays/${{ env.OVERLAY }}
