@@ -1,17 +1,15 @@
-# Build the file-service image, push it to ECR, then apply the matching
-# Kustomize overlay on EKS. Infra values come from SSM Parameter Store:
+# Build the file-service image, push it to ECR, then deploy to EKS with
+# Kustomize (default) or Helm. Infra values come from SSM Parameter Store:
 #   /<project>/<env>/<key>  e.g. /test-k8s/dev/eks_cluster_name
 #
 #   push `dev`              → build + deploy automatically (environment `dev`)
 #   push `master` / `main`  → build only
 #   Run workflow on `master` / `main` / tag → build + deploy (manual prod release)
 #
-# Secrets:
-#   AWS_ACCESS_KEY_ID
-#   AWS_SECRET_ACCESS_KEY
-#
-# Vars (optional):
+# Vars:
+#   AWS_ROLE_ARN
 #   AWS_REGION               defaults to eu-west-1
+#   DEPLOY_TOOL             kustomize (default) | helm
 #
 # IAM: ssm:GetParameter on /test-k8s/* , ECR push, EKS API access.
 
@@ -39,6 +37,7 @@ env:
   SSM_PREFIX: ${{ github.ref_name == 'dev' && '/test-k8s/dev' || '/test-k8s/prod' }}
   OVERLAY: ${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
   FLOATING_TAG: ${{ github.ref_name == 'dev' && 'dev' || 'latest' }}
+  DEPLOY_TOOL: ${{ vars.DEPLOY_TOOL || 'kustomize' }}
 
 jobs:
   build:
@@ -60,7 +59,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
 
       - name: Read SSM parameters
         id: ssm
@@ -125,7 +124,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -133,32 +132,17 @@ jobs:
           version: v1.32.3
 
       - name: Install kustomize
+        if: env.DEPLOY_TOOL == 'kustomize'
         run: |
           curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.6.0/kustomize_v5.6.0_linux_amd64.tar.gz" | tar xz
           sudo mv kustomize /usr/local/bin/kustomize
           kustomize version
 
-      - name: Write overlay config and IRSA role
-        working-directory: k8s/overlays/${{ env.OVERLAY }}
-        env:
-          S3_BUCKET_NAME: ${{ needs.build.outputs.s3_bucket_name }}
-          CLOUDFRONT_DOMAIN: ${{ needs.build.outputs.cloudfront_domain }}
-          IRSA_ROLE_ARN: ${{ needs.build.outputs.irsa_role_arn }}
-        run: |
-          printf 'S3_BUCKET_NAME=%s\nCLOUDFRONT_DOMAIN=%s\n' \
-            "$S3_BUCKET_NAME" "$CLOUDFRONT_DOMAIN" > generated-file-service.env
-          printf '%s\n' \
-            'apiVersion: v1' \
-            'kind: ServiceAccount' \
-            'metadata:' \
-            '  name: file-service' \
-            '  annotations:' \
-            "    eks.amazonaws.com/role-arn: ${IRSA_ROLE_ARN}" \
-            > irsa-patch.yaml
-
-      - name: Set image tag
-        working-directory: k8s/overlays/${{ env.OVERLAY }}
-        run: kustomize edit set image "file-service=${{ needs.build.outputs.ecr_uri }}:${{ needs.build.outputs.image_tag }}"
+      - name: Install Helm
+        if: env.DEPLOY_TOOL == 'helm'
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "${{ needs.build.outputs.cluster }}" --region "${{ vars.AWS_REGION || 'eu-west-1' }}"
@@ -172,8 +156,56 @@ jobs:
             exit 1
           fi
 
-      - name: Apply manifests
-        run: kubectl apply -k "k8s/overlays/${OVERLAY}"
+      - name: Deploy with Kustomize
+        if: env.DEPLOY_TOOL == 'kustomize'
+        env:
+          S3_BUCKET_NAME: ${{ needs.build.outputs.s3_bucket_name }}
+          CLOUDFRONT_DOMAIN: ${{ needs.build.outputs.cloudfront_domain }}
+          IRSA_ROLE_ARN: ${{ needs.build.outputs.irsa_role_arn }}
+          ECR_URI: ${{ needs.build.outputs.ecr_uri }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          (
+            cd "k8s/overlays/${OVERLAY}"
+            printf 'S3_BUCKET_NAME=%s\nCLOUDFRONT_DOMAIN=%s\n' \
+              "$S3_BUCKET_NAME" "$CLOUDFRONT_DOMAIN" > generated-file-service.env
+            printf '%s\n' \
+              'apiVersion: v1' \
+              'kind: ServiceAccount' \
+              'metadata:' \
+              '  name: file-service' \
+              '  annotations:' \
+              "    eks.amazonaws.com/role-arn: ${IRSA_ROLE_ARN}" \
+              > irsa-patch.yaml
+            kustomize edit set image "file-service=${ECR_URI}:${IMAGE_TAG}"
+          )
+          kubectl apply -k "k8s/overlays/${OVERLAY}"
+          kubectl rollout status "deployment/file-service" -n "${K8S_NAMESPACE}" --timeout=180s
 
-      - name: Wait for rollout
-        run: kubectl rollout status "deployment/file-service" -n "${K8S_NAMESPACE}" --timeout=180s
+      - name: Deploy with Helm
+        if: env.DEPLOY_TOOL == 'helm'
+        env:
+          S3_BUCKET_NAME: ${{ needs.build.outputs.s3_bucket_name }}
+          CLOUDFRONT_DOMAIN: ${{ needs.build.outputs.cloudfront_domain }}
+          IRSA_ROLE_ARN: ${{ needs.build.outputs.irsa_role_arn }}
+          ECR_URI: ${{ needs.build.outputs.ecr_uri }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          REPLICAS=1
+          if [ "${DEPLOY_ENV}" != "dev" ]; then REPLICAS=2; fi
+          printf '%s\n' \
+            "replicaCount: ${REPLICAS}" \
+            "image:" \
+            "  repository: ${ECR_URI}" \
+            "  tag: \"${IMAGE_TAG}\"" \
+            "serviceAccount:" \
+            "  annotations:" \
+            "    eks.amazonaws.com/role-arn: \"${IRSA_ROLE_ARN}\"" \
+            "config:" \
+            "  S3_BUCKET_NAME: \"${S3_BUCKET_NAME}\"" \
+            "  CLOUDFRONT_DOMAIN: \"${CLOUDFRONT_DOMAIN}\"" \
+            > /tmp/helm-ci-values.yaml
+          helm upgrade --install file-service ./charts/file-service \
+            -n "${K8S_NAMESPACE}" \
+            -f /tmp/helm-ci-values.yaml \
+            --wait --timeout 180s

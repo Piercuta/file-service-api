@@ -1,0 +1,6 @@
+apiVersion: v2
+name: file-service
+description: File upload service (S3 + CloudFront)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

@@ -1,0 +1,31 @@
+replicaCount: 1
+
+image:
+  repository: file-service
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: file-service
+
+serviceAccount:
+  create: true
+  name: file-service
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 80
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+config:
+  AWS_REGION: eu-west-1
+  S3_BUCKET_NAME: ""
+  CLOUDFRONT_DOMAIN: ""
