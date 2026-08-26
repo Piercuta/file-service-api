@@ -1,8 +1,14 @@
 # Build file-service, push to ECR, then deploy via:
 #   - gitops (default): bump image.tag on GitOps branch main → Argo CD syncs
-#       branch `dev`  → apps/file-service/values-dev.yaml
-#       tag / master  → apps/file-service/values-prod.yaml
+#       branch `dev`            → apps/file-service/values-dev.yaml
+#       tag (must be on `prod`) → apps/file-service/values-prod.yaml
 #   - kustomize / helm: apply directly to EKS (legacy / fallback)
+#
+# Triggers:
+#   push `dev`         → build + deploy (environment `dev`); ECR :sha + :dev
+#   push tag on `prod` → build + deploy prod; ECR :sha + :latest + :<git-tag>
+#                        GitOps values-prod.yaml image.tag = git tag (e.g. v1.2.3)
+#   workflow_dispatch  → build + deploy (env from ref)
 #
 # Secrets: GITOPS_SSH_PRIVATE_KEY (gitops)
 # Vars: AWS_ROLE_ARN, AWS_REGION, DEPLOY_TOOL (gitops|kustomize|helm),
@@ -13,8 +19,6 @@ name: Build and deploy to EKS
 on:
   push:
     branches:
-      - master
-      - main
       - dev
     tags:
       - "*"
@@ -40,17 +44,31 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    environment: ${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
+    environment: ${{ github.ref_type == 'tag' && 'prod' || github.ref_name }}
     outputs:
       cluster: ${{ steps.ssm.outputs.cluster }}
       ecr_uri: ${{ steps.ssm.outputs.ecr_uri }}
       s3_bucket_name: ${{ steps.ssm.outputs.s3_bucket_name }}
       cloudfront_domain: ${{ steps.ssm.outputs.cloudfront_domain }}
       irsa_role_arn: ${{ steps.ssm.outputs.irsa_role_arn }}
-      image_tag: ${{ github.sha }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tag is on prod branch
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          git fetch origin prod:refs/remotes/origin/prod
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/prod; then
+            echo "Refusing prod deploy: tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on branch prod." >&2
+            echo "Create the tag from prod, e.g.: git checkout prod && git tag v1.2.3 && git push origin v1.2.3" >&2
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} is on origin/prod — OK for prod deploy."
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -87,6 +105,28 @@ jobs:
           echo "irsa_role_arn=${IRSA_ROLE_ARN}" >> "$GITHUB_OUTPUT"
           echo "Cluster=${CLUSTER} ECR=${ECR_URI}"
 
+      - name: Resolve image tags
+        id: meta
+        env:
+          ECR_URI: ${{ steps.ssm.outputs.ecr_uri }}
+        run: |
+          set -euo pipefail
+          {
+            echo "${ECR_URI}:${GITHUB_SHA}"
+            echo "${ECR_URI}:${FLOATING_TAG}"
+          } > /tmp/ecr-tags.txt
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "${ECR_URI}:${GITHUB_REF_NAME}" >> /tmp/ecr-tags.txt
+            echo "image_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+          TAGS=$(paste -sd, /tmp/ecr-tags.txt)
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "ECR tags: ${TAGS}"
+
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -98,9 +138,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: |
-            ${{ steps.ssm.outputs.ecr_uri }}:${{ github.sha }}
-            ${{ steps.ssm.outputs.ecr_uri }}:${{ env.FLOATING_TAG }}
+          tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -112,9 +150,9 @@ jobs:
       github.ref_name == 'dev' ||
       startsWith(github.ref, 'refs/tags/') ||
       github.event_name == 'workflow_dispatch'
-    environment: ${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
+    environment: ${{ github.ref_type == 'tag' && 'prod' || github.ref_name }}
     concurrency:
-      group: deploy-eks-file-service-${{ github.ref_name == 'dev' && 'dev' || 'prod' }}
+      group: deploy-eks-file-service-${{ github.ref_type == 'tag' && 'prod' || github.ref_name }}
       cancel-in-progress: false
     steps:
       - name: Checkout
