@@ -63,10 +63,10 @@ build:
       CLUSTER=$(ssm_get eks_cluster_name)
       ECR_URI=$(ssm_get ecr_file_service)
       S3_BUCKET_NAME=$(ssm_get files_bucket_name)
-      MEDIA_BASE_URL=$(ssm_get media_base_url)
+      MEDIA_URL=$(ssm_get media_url)
       IRSA_ROLE_ARN=$(ssm_get file_service_irsa_role_arn)
 
-      CLOUDFRONT_DOMAIN="${MEDIA_BASE_URL#https://}"
+      CLOUDFRONT_DOMAIN="${MEDIA_URL#https://}"
       CLOUDFRONT_DOMAIN="${CLOUDFRONT_DOMAIN#http://}"
       CLOUDFRONT_DOMAIN="${CLOUDFRONT_DOMAIN%/}"
 
