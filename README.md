@@ -34,8 +34,8 @@ AWS_REGION=us-east-1
 # S3 Configuration
 S3_BUCKET_NAME=your-file-bucket-name
 
-# CloudFront Configuration
-CLOUDFRONT_DOMAIN=your-cloudfront-domain.cloudfront.net
+# CloudFront Configuration (dedicated files distribution, host only — path = S3 key)
+CLOUDFRONT_DOMAIN=files-test-k8s.dev.piercuta.com
 ```
 
 ## Development
@@ -84,7 +84,7 @@ The service is designed to run on EKS. Create a Kubernetes deployment with:
 
 - `AWS_REGION`: AWS region
 - `S3_BUCKET_NAME`: S3 bucket name
-- `CLOUDFRONT_DOMAIN`: CloudFront distribution domain
+- `CLOUDFRONT_DOMAIN`: Public hostname of the files CloudFront distribution (e.g. `files-test-k8s.dev.piercuta.com`)
 - `DEBUG`: Enable debug mode (true/false)
 - `MAX_FILE_SIZE`: Maximum file size in bytes (default: 100MB)
 
