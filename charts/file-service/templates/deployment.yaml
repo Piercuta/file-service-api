@@ -26,6 +26,10 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "file-service.fullname" . }}-config
+            {{- if .Values.externalSecrets.enabled }}
+            - secretRef:
+                name: {{ include "file-service.fullname" . }}-ssm
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /health
