@@ -4,6 +4,8 @@ metadata:
   name: {{ include "file-service.fullname" . }}
   labels:
     {{- include "file-service.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -13,6 +15,16 @@ spec:
     metadata:
       labels:
         {{- include "file-service.labels" . | nindent 8 }}
+      annotations:
+        # FastAPI/Python only — skip Java/Node/.NET OTel init containers (faster pod startup).
+        instrumentation.opentelemetry.io/inject-python: "true"
+        instrumentation.opentelemetry.io/inject-java: "false"
+        instrumentation.opentelemetry.io/inject-nodejs: "false"
+        instrumentation.opentelemetry.io/inject-dotnet: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-python: "true"
+        cloudwatch.aws.amazon.com/auto-annotate-java: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-nodejs: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-dotnet: "false"
     spec:
       serviceAccountName: {{ include "file-service.serviceAccountName" . }}
       containers:
@@ -30,17 +42,26 @@ spec:
             - secretRef:
                 name: {{ include "file-service.fullname" . }}-ssm
             {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}

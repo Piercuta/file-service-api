@@ -15,6 +15,15 @@ spec:
       labels:
         app.kubernetes.io/name: file-service
         app.kubernetes.io/component: files
+      annotations:
+        instrumentation.opentelemetry.io/inject-python: "true"
+        instrumentation.opentelemetry.io/inject-java: "false"
+        instrumentation.opentelemetry.io/inject-nodejs: "false"
+        instrumentation.opentelemetry.io/inject-dotnet: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-python: "true"
+        cloudwatch.aws.amazon.com/auto-annotate-java: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-nodejs: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-dotnet: "false"
     spec:
       serviceAccountName: file-service
       containers:
@@ -27,18 +36,27 @@ spec:
           envFrom:
             - configMapRef:
                 name: file-service-config
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m
