@@ -1,0 +1,64 @@
+name: Read file-service SSM parameters
+description: Load EKS, ECR, and app config from SSM for the file-service.
+
+inputs:
+  ssm_prefix:
+    description: SSM parameter prefix (e.g. /test-k8s/dev)
+    required: true
+
+outputs:
+  cluster:
+    description: EKS cluster name
+    value: ${{ steps.read.outputs.cluster }}
+  ecr_uri:
+    description: ECR repository URI for the file-service image
+    value: ${{ steps.read.outputs.ecr_uri }}
+  s3_bucket_name:
+    description: S3 bucket for uploaded files
+    value: ${{ steps.read.outputs.s3_bucket_name }}
+  cloudfront_domain:
+    description: CloudFront domain for media URLs
+    value: ${{ steps.read.outputs.cloudfront_domain }}
+  irsa_role_arn:
+    description: IRSA role ARN for the file-service ServiceAccount
+    value: ${{ steps.read.outputs.irsa_role_arn }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read SSM parameters
+      id: read
+      shell: bash
+      env:
+        SSM_PREFIX: ${{ inputs.ssm_prefix }}
+      run: |
+        set -euo pipefail
+
+        ssm_get() {
+          val=$(aws ssm get-parameter --name "${SSM_PREFIX}/$1" --query Parameter.Value --output text)
+          if [ -z "$val" ] || [ "$val" = "None" ]; then
+            echo "Missing SSM parameter: ${SSM_PREFIX}/$1" >&2
+            exit 1
+          fi
+          printf '%s' "$val"
+        }
+
+        CLUSTER=$(ssm_get eks_cluster_name)
+        ECR_URI=$(ssm_get ecr_file_service)
+        S3_BUCKET_NAME=$(ssm_get files_bucket_name)
+        MEDIA_URL=$(ssm_get media_url)
+        IRSA_ROLE_ARN=$(ssm_get file_service_irsa_role_arn)
+
+        CLOUDFRONT_DOMAIN="${MEDIA_URL#https://}"
+        CLOUDFRONT_DOMAIN="${CLOUDFRONT_DOMAIN#http://}"
+        CLOUDFRONT_DOMAIN="${CLOUDFRONT_DOMAIN%/}"
+
+        {
+          echo "cluster=${CLUSTER}"
+          echo "ecr_uri=${ECR_URI}"
+          echo "s3_bucket_name=${S3_BUCKET_NAME}"
+          echo "cloudfront_domain=${CLOUDFRONT_DOMAIN}"
+          echo "irsa_role_arn=${IRSA_ROLE_ARN}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Cluster=${CLUSTER} ECR=${ECR_URI}"

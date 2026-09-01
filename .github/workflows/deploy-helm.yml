@@ -1,0 +1,101 @@
+name: Deploy Helm (file-service)
+run-name: file-service · Helm · ${{ inputs.environment }} · ${{ inputs.image_tag }}
+
+# Deploy file-service directly to EKS with Helm (fallback — bypasses GitOps).
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      image_tag:
+        description: ECR image tag (commit SHA or release tag)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  K8S_NAMESPACE: test-k8s
+  DEPLOY_ENV: ${{ inputs.environment }}
+  SSM_PREFIX: /test-k8s/${{ inputs.environment }}
+  IMAGE_TAG: ${{ inputs.image_tag }}
+
+jobs:
+  deploy:
+    name: Helm upgrade
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-helm-file-service-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+
+      - name: Read SSM parameters
+        id: ssm
+        uses: ./.github/actions/read-file-service-ssm
+        with:
+          ssm_prefix: ${{ env.SSM_PREFIX }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.3
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "${{ steps.ssm.outputs.cluster }}" --region "${{ vars.AWS_REGION || 'eu-west-1' }}"
+
+      - name: Verify cluster access
+        run: |
+          aws sts get-caller-identity
+          if ! kubectl get namespace "${K8S_NAMESPACE}"; then
+            echo "EKS rejected these credentials." >&2
+            exit 1
+          fi
+
+      - name: Deploy with Helm
+        env:
+          S3_BUCKET_NAME: ${{ steps.ssm.outputs.s3_bucket_name }}
+          CLOUDFRONT_DOMAIN: ${{ steps.ssm.outputs.cloudfront_domain }}
+          IRSA_ROLE_ARN: ${{ steps.ssm.outputs.irsa_role_arn }}
+          ECR_URI: ${{ steps.ssm.outputs.ecr_uri }}
+        run: |
+          set -euo pipefail
+          REPLICAS=1
+          if [ "${DEPLOY_ENV}" != "dev" ]; then REPLICAS=2; fi
+          printf '%s\n' \
+            "replicaCount: ${REPLICAS}" \
+            "image:" \
+            "  repository: ${ECR_URI}" \
+            "  tag: \"${IMAGE_TAG}\"" \
+            "serviceAccount:" \
+            "  annotations:" \
+            "    eks.amazonaws.com/role-arn: \"${IRSA_ROLE_ARN}\"" \
+            "config:" \
+            "  S3_BUCKET_NAME: \"${S3_BUCKET_NAME}\"" \
+            "  CLOUDFRONT_DOMAIN: \"${CLOUDFRONT_DOMAIN}\"" \
+            > /tmp/helm-ci-values.yaml
+          helm upgrade --install file-service ./charts/file-service \
+            -n "${K8S_NAMESPACE}" \
+            -f /tmp/helm-ci-values.yaml \
+            --wait --timeout 180s

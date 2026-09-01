@@ -1,0 +1,100 @@
+name: Deploy Kustomize (file-service)
+run-name: file-service · Kustomize · ${{ inputs.environment }} · ${{ inputs.image_tag }}
+
+# Deploy file-service directly to EKS with Kustomize (legacy fallback — bypasses GitOps).
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      image_tag:
+        description: ECR image tag (commit SHA or release tag)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  K8S_NAMESPACE: test-k8s
+  DEPLOY_ENV: ${{ inputs.environment }}
+  SSM_PREFIX: /test-k8s/${{ inputs.environment }}
+  OVERLAY: ${{ inputs.environment }}
+  IMAGE_TAG: ${{ inputs.image_tag }}
+
+jobs:
+  deploy:
+    name: Kustomize apply
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-kustomize-file-service-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+
+      - name: Read SSM parameters
+        id: ssm
+        uses: ./.github/actions/read-file-service-ssm
+        with:
+          ssm_prefix: ${{ env.SSM_PREFIX }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.3
+
+      - name: Install kustomize
+        run: |
+          curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.6.0/kustomize_v5.6.0_linux_amd64.tar.gz" | tar xz
+          sudo mv kustomize /usr/local/bin/kustomize
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "${{ steps.ssm.outputs.cluster }}" --region "${{ vars.AWS_REGION || 'eu-west-1' }}"
+
+      - name: Verify cluster access
+        run: |
+          aws sts get-caller-identity
+          if ! kubectl get namespace "${K8S_NAMESPACE}"; then
+            echo "EKS rejected these credentials." >&2
+            exit 1
+          fi
+
+      - name: Deploy with Kustomize
+        env:
+          S3_BUCKET_NAME: ${{ steps.ssm.outputs.s3_bucket_name }}
+          CLOUDFRONT_DOMAIN: ${{ steps.ssm.outputs.cloudfront_domain }}
+          IRSA_ROLE_ARN: ${{ steps.ssm.outputs.irsa_role_arn }}
+          ECR_URI: ${{ steps.ssm.outputs.ecr_uri }}
+        run: |
+          set -euo pipefail
+          (
+            cd "k8s/overlays/${OVERLAY}"
+            printf 'S3_BUCKET_NAME=%s\nCLOUDFRONT_DOMAIN=%s\n' \
+              "$S3_BUCKET_NAME" "$CLOUDFRONT_DOMAIN" > generated-file-service.env
+            printf '%s\n' \
+              'apiVersion: v1' \
+              'kind: ServiceAccount' \
+              'metadata:' \
+              '  name: file-service' \
+              '  annotations:' \
+              "    eks.amazonaws.com/role-arn: ${IRSA_ROLE_ARN}" \
+              > irsa-patch.yaml
+            kustomize edit set image "file-service=${ECR_URI}:${IMAGE_TAG}"
+          )
+          kubectl apply -k "k8s/overlays/${OVERLAY}"
+          kubectl rollout status "deployment/file-service" -n "${K8S_NAMESPACE}" --timeout=180s
